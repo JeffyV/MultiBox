@@ -1,0 +1,80 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x64
+            out_dir: x64
+          - platform: Win32
+            out_dir: x86
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Prebuild embedded MemoryDll (x86 + x64)
+        shell: pwsh
+        run: |
+          # 2Box.rc 通过 embed_dll.rc 同时把 MemoryDll32.dll 和 MemoryDll64.dll
+          # 内嵌进 2Box.exe，但解决方案里 BuildDllHelper 的平台映射是交叉的，
+          # 单平台构建只会产出其中一个，这里显式补齐两个架构，保证 RC 编译不失败。
+          $sd = $env:GITHUB_WORKSPACE + '\'
+          msbuild MemoryDll/MemoryDll.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SolutionDir=$sd /m /nologo /v:minimal
+          msbuild MemoryDll/MemoryDll.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:SolutionDir=$sd /m /nologo /v:minimal
+
+      - name: Build solution
+        run: >
+          msbuild 2Box.sln
+          /p:Configuration=Release
+          /p:Platform=${{ matrix.platform }}
+          /m
+          /nologo
+          /v:minimal
+
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          $exe1 = "bin/${{ matrix.out_dir }}/2Box.exe"
+          $exe2 = "bin/${{ matrix.out_dir }}/2Box-cli.exe"
+          if (-not (Test-Path $exe1)) { throw "Missing $exe1" }
+          if (-not (Test-Path $exe2)) { throw "Missing $exe2" }
+          Get-ChildItem "bin/${{ matrix.out_dir }}" | Format-Table Name, Length
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2Box-Release-${{ matrix.out_dir }}
+          path: bin/${{ matrix.out_dir }}/
+          if-no-files-found: error
+
+      - name: Package zip
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: Compress-Archive -Path "bin/${{ matrix.out_dir }}/*" -DestinationPath "2Box-${{ matrix.out_dir }}.zip"
+
+      - name: Attach zip to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: 2Box-${{ matrix.out_dir }}.zip
